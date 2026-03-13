@@ -73,11 +73,19 @@ let pendingResolve: ((value: string) => void) | null = null;
 let pendingReason: string | null = null;
 let feedbackEnabled = true;
 
+const taskQueue: string[] = [];
+let autoMode = false;
+const AUTO_DELAY_MS = 1500;
+
 interface TrackedSocket extends WebSocket {
   isAlive: boolean;
 }
 
 const connectedClients = new Set<TrackedSocket>();
+
+function broadcastQueueState() {
+  broadcast({ type: "queue", tasks: [...taskQueue], autoMode });
+}
 
 function checkAuth(req: http.IncomingMessage): boolean {
   if (!AUTH_TOKEN) return true;
@@ -278,6 +286,44 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.url === "/api/queue" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json", ...cors });
+    res.end(JSON.stringify({ tasks: [...taskQueue], autoMode }));
+    return;
+  }
+
+  if (req.url === "/api/queue" && req.method === "POST") {
+    const body = await readBody(req);
+    try {
+      const data = JSON.parse(body);
+      if (data.action === "add" && typeof data.task === "string" && data.task.trim()) {
+        taskQueue.push(data.task.trim());
+        broadcastQueueState();
+      } else if (data.action === "remove" && typeof data.index === "number") {
+        if (data.index >= 0 && data.index < taskQueue.length) {
+          taskQueue.splice(data.index, 1);
+          broadcastQueueState();
+        }
+      } else if (data.action === "clear") {
+        taskQueue.length = 0;
+        broadcastQueueState();
+      } else if (data.action === "reorder" && Array.isArray(data.tasks)) {
+        taskQueue.length = 0;
+        taskQueue.push(...data.tasks.filter((t: unknown) => typeof t === "string" && (t as string).trim()));
+        broadcastQueueState();
+      } else if (data.action === "autoMode" && typeof data.enabled === "boolean") {
+        autoMode = data.enabled;
+        broadcastQueueState();
+      }
+      res.writeHead(200, { "Content-Type": "application/json", ...cors });
+      res.end(JSON.stringify({ ok: true, tasks: [...taskQueue], autoMode }));
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json", ...cors });
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+    }
+    return;
+  }
+
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json", ...cors });
     res.end(
@@ -287,6 +333,8 @@ const httpServer = http.createServer(async (req, res) => {
         clients: connectedClients.size,
         historyCount: history.length,
         feedbackEnabled,
+        queueLength: taskQueue.length,
+        autoMode,
       })
     );
     return;
@@ -331,6 +379,7 @@ wss.on("connection", (rawWs, req) => {
   });
 
   ws.send(JSON.stringify({ type: "mode", enabled: feedbackEnabled }));
+  ws.send(JSON.stringify({ type: "queue", tasks: [...taskQueue], autoMode }));
 
   if (pendingResolve && pendingReason) {
     ws.send(
@@ -363,6 +412,22 @@ wss.on("connection", (rawWs, req) => {
         );
         broadcast({ type: "mode", enabled: feedbackEnabled });
         notifyPollWaiters();
+      } else if (data.type === "queue") {
+        if (data.action === "add" && typeof data.task === "string" && data.task.trim()) {
+          taskQueue.push(data.task.trim());
+          broadcastQueueState();
+        } else if (data.action === "remove" && typeof data.index === "number") {
+          if (data.index >= 0 && data.index < taskQueue.length) {
+            taskQueue.splice(data.index, 1);
+            broadcastQueueState();
+          }
+        } else if (data.action === "clear") {
+          taskQueue.length = 0;
+          broadcastQueueState();
+        } else if (data.action === "autoMode" && typeof data.enabled === "boolean") {
+          autoMode = data.enabled;
+          broadcastQueueState();
+        }
       }
     } catch {
       console.error("[feedback-collector] Invalid message from client");
@@ -490,6 +555,27 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     pendingReason = reason;
     broadcast({ type: "question", reason });
     notifyPollWaiters();
+
+    if (taskQueue.length > 0) {
+      const nextTask = taskQueue.shift()!;
+      broadcastQueueState();
+      console.error(`[feedback-collector] Auto-dequeued task: ${nextTask}`);
+
+      await new Promise((r) => setTimeout(r, AUTO_DELAY_MS));
+
+      addHistoryEntry("human", `[QUEUE] ${nextTask}`);
+      pendingReason = null;
+      broadcast({
+        type: "resolved",
+        message: `Queue task dispatched: ${nextTask}`,
+        autoTask: nextTask,
+      });
+      notifyPollWaiters();
+
+      return {
+        content: [{ type: "text", text: nextTask }],
+      };
+    }
 
     const humanResponse = await new Promise<string>((resolve) => {
       pendingResolve = resolve;
