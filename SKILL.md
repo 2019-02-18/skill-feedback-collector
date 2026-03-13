@@ -1,152 +1,115 @@
 ---
 name: skill-feedback-collector
-description: MCP-based human feedback collector that suspends AI threads via WebSocket UI to prevent premature conversation endings. Use when working with token-limited coding plans (Tencent Cloud, Alibaba Cloud), when you need human-in-the-loop confirmation before ending a task, or when you want to maximize each conversation round by collecting feedback instead of guessing.
-metadata: {"clawdbot":{"emoji":"💬","requires":{"anyBins":["node","npm"]},"install":[{"id":"npm-install","kind":"node","package":"skill-feedback-collector","bins":["node"],"label":"Install dependencies: npm install && npm run build"}],"os":["linux","darwin","win32"]}}
+description: Human-in-the-loop MCP feedback collector with task queue. Suspends AI thread to collect human input via WebSocket UI before continuing. Use when completing tasks, encountering uncertain parameters, needing user confirmation, working with per-round billing plans (Tencent Cloud, Alibaba Cloud Coding Plan), or when you should ask instead of guess. Also covers batch task execution via auto-dequeue.
+metadata: {"clawdbot":{"emoji":"💬","requires":{"anyBins":["node","npm"]},"install":[{"id":"npm-install","kind":"node","package":"skill-feedback-collector","bins":["node"],"label":"npm install && npm run build"}],"os":["linux","darwin","win32"]}}
 ---
 
 # Skill Feedback Collector
 
-A human-in-the-loop MCP skill that suspends AI threads and waits for real human feedback through a WebSocket-connected web UI. Designed for token-limited coding plans (Tencent Cloud, Alibaba Cloud) to maximize the value of each conversation round.
+Suspend the AI agent loop and wait for real human feedback via WebSocket-connected browser UI. Supports batch task execution through an auto-dequeue task queue.
 
 ## When to Use
 
-- After completing any coding task, before ending the conversation
-- When encountering uncertain parameters (colors, layouts, business logic) — never guess
-- When a task is done and you need the user to verify the result
-- When you need clarification on ambiguous requirements
-- When the user is on a per-round billing plan and wants to continue working in the same session
-- Before making any destructive or irreversible changes
+- After completing any task — ask user to verify before moving on
+- When encountering uncertain parameters (colors, layouts, API choices, business logic)
+- When you need user confirmation before destructive or irreversible changes
+- When the user wants to maximize a single conversation round (per-round billing)
+- When you want to batch-execute multiple tasks without manual intervention per task
 
-## Critical Rules
+## Instructions
 
-**YOU MUST FOLLOW THESE RULES WITHOUT EXCEPTION:**
+**MANDATORY BEHAVIOR — follow without exception:**
 
-1. **NEVER end a conversation on your own.** Always call `ask_human_feedback` to ask the user if they want to continue or end.
-2. **NEVER guess uncertain parameters.** If you are unsure about colors, sizes, layouts, API choices, business logic, or any implementation detail, call `ask_human_feedback` with your question.
-3. **After every completed task**, call `ask_human_feedback` with a summary of what you did and ask if the user wants to continue with more tasks.
-4. **After every error fix**, call `ask_human_feedback` to confirm the fix works and ask for next steps.
-5. **The user's response from `ask_human_feedback` is your next instruction.** Follow it precisely.
+1. **NEVER end your response without calling `ask_human_feedback`.** Your response must always end with a tool call to `ask_human_feedback`. This keeps the agent loop alive within the same session run.
 
-## How It Works
+2. **NEVER guess.** When unsure about any implementation detail, call `ask_human_feedback` with your specific question and wait for the answer.
 
-### Architecture
+3. **After every completed task**, call `ask_human_feedback` with:
+   - A summary of what you did (be specific)
+   - What you need from the user (verify, continue, or end)
+   - Numbered options for next steps
 
-```
-┌─────────────┐     stdio      ┌──────────────────┐     WebSocket     ┌──────────────┐
-│  AI Agent   │◄──────────────►│  MCP Server      │◄────────────────►│  Browser UI  │
-│  (OpenClaw) │  MCP Protocol  │  (Node.js)       │   Port 18061     │  (index.html)│
-└─────────────┘                └──────────────────┘                   └──────────────┘
-```
+4. **Treat the response from `ask_human_feedback` as your next instruction.** Execute it immediately, then call `ask_human_feedback` again when done. This creates a continuous work loop.
 
-1. AI calls `ask_human_feedback` tool with a `reason` (summary + question)
-2. MCP Server broadcasts the reason to all connected browser clients via WebSocket
-3. The AI thread is **suspended** (Promise pending) — no tokens consumed while waiting
-4. Human reads the question in the browser UI and types a response
-5. Response is sent back through WebSocket → MCP Server resolves the Promise
-6. AI receives the human's text and continues working
+5. **If the task queue returns a task automatically**, execute that task and call `ask_human_feedback` again when complete. The queue will auto-feed the next task until empty.
 
-### Setup
+6. **Mode control:**
+   - User says "自由模式" / "free mode" → call `set_feedback_mode(enabled: false)` → work autonomously
+   - User says "确认模式" / "feedback mode" → call `set_feedback_mode(enabled: true)` → resume confirmation loop
 
-```bash
-# Install dependencies
-npm install
+## Safety Rules
 
-# Build TypeScript
-npm run build
+- Never end a session or conversation on your own — always ask the user first
+- Never commit destructive changes (force push, drop table, delete files) without explicit user confirmation via `ask_human_feedback`
+- If `ask_human_feedback` returns a bypass message (feedback mode disabled), continue working without pausing
 
-# The MCP server starts via stdio, WebSocket UI on port 3001
-# Configure in your OpenClaw MCP settings:
-# Command: node
-# Args: ["build/index.js"]
-```
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FEEDBACK_PORT` | `18061` | Port for WebSocket + HTTP UI server |
-| `FEEDBACK_TOKEN` | (empty) | Optional auth token for API/WebSocket access |
-
-### Accessing the UI
-
-Open your browser and navigate to:
-```
-http://<your-server-ip>:18061
-```
-
-The UI auto-connects via WebSocket. When the AI calls `ask_human_feedback`, the question appears in the UI and you can type your response.
-
-## Tool Reference
+## Tools
 
 ### `ask_human_feedback`
 
-Suspends the AI thread and waits for human input. If feedback mode is disabled, returns immediately without waiting.
+Suspends the agent loop. Broadcasts `reason` to browser UI via WebSocket. Returns human's text response. If task queue is non-empty, auto-dequeues the next task and returns it immediately (1.5s delay for UI visibility).
 
-**Parameters:**
-- `reason` (string, required): A clear summary of completed work and what you need from the user.
+**Parameters:** `reason` (string) — summary of work done + what you need from the user.
 
-**Returns:** The human's text response as a string (or bypass message if disabled).
+**Example reason format:**
+```
+✅ Completed: [specific work done]
+📋 Changes: [files modified, endpoints added, etc.]
+
+What would you like me to do next?
+1. [Option A]
+2. [Option B]
+3. Something else — please describe
+```
 
 ### `set_feedback_mode`
 
-Enable or disable feedback confirmation mode.
+Toggle feedback confirmation on/off. When off, `ask_human_feedback` returns immediately without suspending.
 
-**Parameters:**
-- `enabled` (boolean, required): `true` to enable, `false` to disable.
+**Parameters:** `enabled` (boolean)
 
-**When to use:**
-- User says "自由模式" / "free mode" → call with `enabled: false`
-- User says "确认模式" / "feedback mode" → call with `enabled: true`
-- The mode can also be toggled from the browser UI
+## Setup
 
-**Example usage pattern:**
-
-```
-After completing a task:
-→ call ask_human_feedback with reason:
-  "✅ I've completed the user login API endpoint.
-   - Added POST /api/login route
-   - Implemented JWT token generation
-   - Added input validation
-
-   Would you like me to:
-   1. Add unit tests for this endpoint?
-   2. Move on to the registration endpoint?
-   3. Something else?
-   
-   Or type 'done' if you want to end this session."
+```bash
+npm install && npm run build
 ```
 
-```
-When encountering uncertainty:
-→ call ask_human_feedback with reason:
-  "❓ I need your input on the database schema:
-   - Should the `users` table use UUID or auto-increment for the primary key?
-   - Do you need a `deleted_at` column for soft deletes?
-   
-   Please advise."
+MCP configuration:
+```json
+{
+  "command": "node",
+  "args": ["build/index.js"],
+  "cwd": "/path/to/skill-feedback-collector"
+}
 ```
 
-## Conversation Flow Example
+Browser UI: `http://<server-ip>:18061`
+
+| Env Variable | Default | Description |
+|---|---|---|
+| `FEEDBACK_PORT` | `18061` | HTTP + WebSocket port |
+| `FEEDBACK_TOKEN` | (empty) | Optional auth token |
+
+## Agent Loop Flow
 
 ```
-AI: [completes task] → calls ask_human_feedback("✅ Task done. Continue?")
-    ⏸️ AI thread suspended, no tokens consumed
-Human: [reads in browser] → "Yes, now add error handling"
-AI: [receives response] → works on error handling
-AI: [completes task] → calls ask_human_feedback("✅ Error handling added. Next?")
-    ⏸️ AI thread suspended again
-Human: "Looks good, let's end here"
-AI: [receives response] → ends gracefully
+User message → Agent works → calls ask_human_feedback("Done. Next?")
+                                    ↓
+                    [Queue has tasks?] → YES → auto-return next task → Agent continues
+                                    ↓ NO
+                    [Wait for human input via browser UI]
+                                    ↓
+                    Human responds → Agent receives → works → calls ask_human_feedback again
+                                    ↓
+                    ... loop continues until user says "done" or "end" ...
 ```
 
 ## Tips
 
-- The WebSocket server binds to `0.0.0.0` so it's accessible from any network interface — make sure your server firewall allows the port.
-- The UI auto-reconnects every 3 seconds if the connection drops, so you won't miss any AI questions.
-- Press Enter to send feedback quickly (Shift+Enter for newlines).
-- The conversation history is displayed in the UI so you can track the full interaction flow.
-- Set `FEEDBACK_PORT` environment variable to change the default port if 18061 is occupied.
-- For production servers, consider putting the UI behind a reverse proxy (nginx) with authentication.
-- The `reason` parameter should be detailed — include what was done, what's pending, and specific options for the user.
-- This skill is especially valuable for per-round billing plans where ending a conversation means starting a new billable round.
+- The task queue lets users pre-load multiple tasks; AI executes them sequentially without pausing
+- Users can add tasks to the queue while AI is working — they'll be picked up automatically
+- WebSocket server binds to `0.0.0.0` — ensure firewall allows the port
+- HTTP long-polling fallback activates automatically when WebSocket is unavailable
+- Browser notifications + sound alert when AI asks a question
+- History is persisted to `feedback-history.json` (max 500 entries)
+- Use `FEEDBACK_TOKEN` to protect the UI when deployed on public servers
