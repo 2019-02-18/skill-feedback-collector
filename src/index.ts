@@ -412,6 +412,9 @@ wss.on("connection", (rawWs, req) => {
         );
         broadcast({ type: "mode", enabled: feedbackEnabled });
         notifyPollWaiters();
+      } else if (data.type === "requestHistory") {
+        const recent = history.slice(-100).reverse();
+        ws.send(JSON.stringify({ type: "history", items: recent }));
       } else if (data.type === "queue") {
         if (data.action === "add" && typeof data.task === "string" && data.task.trim()) {
           taskQueue.push(data.task.trim());

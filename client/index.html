@@ -402,18 +402,31 @@
     log.insertBefore(el, log.firstChild);
   }
 
-  function loadHistory(){
+  var historyLoaded = false;
+
+  function loadHistoryFromItems(items){
+    if(historyLoaded || !items || !items.length) return;
+    historyLoaded = true;
+    items.reverse().forEach(function(e){
+      pushLog(e.role === "ai" ? "ai" : "user", e.text, e.timestamp);
+    });
+  }
+
+  function loadHistoryHttp(){
     fetch(baseUrl + "/api/history")
       .then(function(r){ return r.json(); })
-      .then(function(items){
-        if(!items || !items.length) return;
-        items.reverse().forEach(function(e){
-          pushLog(e.role === "ai" ? "ai" : "user", e.text, e.timestamp);
-        });
-      })
+      .then(function(items){ loadHistoryFromItems(items); })
       .catch(function(){});
   }
-  loadHistory();
+
+  function requestHistoryViaWs(){
+    if(historyLoaded) return;
+    if(ws && ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify({ type: "requestHistory" }));
+    }
+  }
+
+  loadHistoryHttp();
 
   function syncMode(enabled){
     modeToggle.checked = enabled;
@@ -580,6 +593,7 @@
       wsFails = 0;
       transport = "ws";
       setConn("ok", "Connected");
+      setTimeout(requestHistoryViaWs, 300);
     };
     ws.onmessage = function(evt){
       try{
@@ -588,6 +602,7 @@
         else if(d.type === "resolved") clearQuestion();
         else if(d.type === "mode") syncMode(!!d.enabled);
         else if(d.type === "queue") renderQueue(d.tasks);
+        else if(d.type === "history" && d.items) loadHistoryFromItems(d.items);
       }catch(e){}
     };
     ws.onclose = function(){
