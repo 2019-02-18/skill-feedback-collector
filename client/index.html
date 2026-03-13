@@ -406,11 +406,13 @@
 
   let ws = null;
   let hasHistory = false;
+  let transport = "none"; // "ws" | "poll" | "none"
+  let pollSeq = 0;
+  let pollActive = false;
+  let currentPending = false;
 
-  const wsUrl = (function(){
-    const p = location.protocol === "https:" ? "wss:" : "ws:";
-    return p + "//" + location.host;
-  })();
+  const baseUrl = location.origin;
+  const wsUrl = (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host;
 
   function setConn(state, label){
     dot.className = "conn-dot " + state;
@@ -440,7 +442,7 @@
   }
 
   function loadHistory(){
-    fetch("/api/history")
+    fetch(baseUrl + "/api/history")
       .then(function(r){ return r.json(); })
       .then(function(items){
         if(!items || !items.length) return;
@@ -452,91 +454,177 @@
   }
   loadHistory();
 
+  function syncMode(enabled){
+    modeToggle.checked = enabled;
+    modeText.textContent = enabled ? "ON" : "OFF";
+  }
+
   function showQuestion(reason){
+    if(currentPending) return;
+    currentPending = true;
     qText.className = "q-text";
     qText.textContent = reason;
     panel.classList.add("live");
     stateTag.className = "tag tag-active";
     stateTag.textContent = "WAITING";
     quickBar.classList.add("show");
-    setConn("wait", "AI is waiting for your feedback");
+    setConn("wait", "AI is waiting for your feedback" + (transport === "poll" ? " [HTTP]" : ""));
     setEditable(true);
     pushLog("ai", reason);
   }
 
   function clearQuestion(){
+    currentPending = false;
     qText.className = "q-empty";
     qText.textContent = "Waiting for AI...";
     panel.classList.remove("live");
     stateTag.className = "tag tag-idle";
     stateTag.textContent = "IDLE";
     quickBar.classList.remove("show");
-    setConn("ok", "Connected");
+    var mode = transport === "ws" ? "" : " [HTTP]";
+    setConn("ok", "Connected" + mode);
     setEditable(false);
     input.value = "";
   }
 
-  function send(){
-    const t = input.value.trim();
-    if(!t || !ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "feedback", text: t }));
-    pushLog("user", t);
-    clearQuestion();
+  function sendFeedback(){
+    var t = input.value.trim();
+    if(!t) return;
+
+    if(transport === "ws" && ws && ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify({ type: "feedback", text: t }));
+      pushLog("user", t);
+      clearQuestion();
+    } else {
+      fetch(baseUrl + "/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: t })
+      }).then(function(r){ return r.json(); })
+        .then(function(d){
+          if(d.ok){
+            pushLog("user", t);
+            clearQuestion();
+          }
+        })
+        .catch(function(){});
+    }
   }
 
-  sendBtn.addEventListener("click", send);
-  input.addEventListener("keydown", function(e){
-    if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); send(); }
-  });
+  function toggleMode(enabled){
+    if(transport === "ws" && ws && ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify({ type: "toggle", enabled: enabled }));
+    } else {
+      fetch(baseUrl + "/api/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: enabled })
+      }).catch(function(){});
+    }
+  }
 
+  sendBtn.addEventListener("click", sendFeedback);
+  input.addEventListener("keydown", function(e){
+    if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); sendFeedback(); }
+  });
   input.addEventListener("input", function(){
     this.style.height = "auto";
     this.style.height = Math.min(this.scrollHeight, 160) + "px";
   });
-
   quickBar.addEventListener("click", function(e){
-    const chip = e.target.closest(".chip");
+    var chip = e.target.closest(".chip");
     if(!chip) return;
     input.value = chip.dataset.v;
-    send();
+    sendFeedback();
   });
-
   modeToggle.addEventListener("change", function(){
-    const enabled = modeToggle.checked;
+    var enabled = modeToggle.checked;
     modeText.textContent = enabled ? "ON" : "OFF";
-    if(ws && ws.readyState === WebSocket.OPEN){
-      ws.send(JSON.stringify({ type: "toggle", enabled: enabled }));
-    }
+    toggleMode(enabled);
   });
 
-  function syncMode(enabled){
-    modeToggle.checked = enabled;
-    modeText.textContent = enabled ? "ON" : "OFF";
-  }
+  // --- WebSocket transport ---
+  var wsFails = 0;
 
-  function connect(){
+  function connectWs(){
     if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-    setConn("err", "Connecting...");
-    ws = new WebSocket(wsUrl);
-    ws.onopen = function(){ setConn("ok", "Connected"); };
+    setConn("err", "Connecting (WebSocket)...");
+
+    try { ws = new WebSocket(wsUrl); } catch(e) {
+      fallbackToPoll();
+      return;
+    }
+
+    var openTimer = setTimeout(function(){
+      if(ws.readyState !== WebSocket.OPEN){ ws.close(); fallbackToPoll(); }
+    }, 5000);
+
+    ws.onopen = function(){
+      clearTimeout(openTimer);
+      wsFails = 0;
+      transport = "ws";
+      setConn("ok", "Connected");
+    };
     ws.onmessage = function(evt){
       try{
-        const d = JSON.parse(evt.data);
+        var d = JSON.parse(evt.data);
         if(d.type === "question" && d.reason) showQuestion(d.reason);
         else if(d.type === "resolved") clearQuestion();
-        else if(d.type === "waiting") setConn("wait", "Pending request — check UI");
         else if(d.type === "mode") syncMode(!!d.enabled);
       }catch(e){/* ignore */}
     };
     ws.onclose = function(){
-      setConn("err", "Disconnected — reconnecting...");
-      setEditable(false);
-      setTimeout(connect, 3000);
+      clearTimeout(openTimer);
+      wsFails++;
+      if(wsFails >= 3){
+        fallbackToPoll();
+      } else {
+        setConn("err", "Reconnecting...");
+        setEditable(false);
+        setTimeout(connectWs, 2000);
+      }
     };
     ws.onerror = function(){ ws.close(); };
   }
 
-  connect();
+  // --- HTTP Polling fallback ---
+  function fallbackToPoll(){
+    transport = "poll";
+    setConn("ok", "Connected [HTTP]");
+    if(!pollActive) startPolling();
+  }
+
+  function startPolling(){
+    pollActive = true;
+    poll();
+  }
+
+  function poll(){
+    if(transport !== "poll"){ pollActive = false; return; }
+
+    fetch(baseUrl + "/api/poll?seq=" + pollSeq)
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        pollSeq = d.seq || pollSeq;
+        syncMode(!!d.enabled);
+        if(d.pending && d.reason && !currentPending){
+          showQuestion(d.reason);
+        } else if(!d.pending && currentPending){
+          clearQuestion();
+        }
+        if(!d.pending && !currentPending){
+          setConn("ok", "Connected [HTTP]");
+        }
+        setTimeout(poll, 100);
+      })
+      .catch(function(){
+        setConn("err", "Connection lost — retrying...");
+        setTimeout(poll, 3000);
+      });
+  }
+
+  // --- Init: try WebSocket first, fallback to HTTP polling ---
+  connectWs();
 })();
 </script>
 </body>

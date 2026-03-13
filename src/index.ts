@@ -70,8 +70,54 @@ let pendingReason: string | null = null;
 let feedbackEnabled = true;
 const connectedClients = new Set<WebSocket>();
 
-const httpServer = http.createServer((req, res) => {
-  const cors = { "Access-Control-Allow-Origin": "*" };
+const pollWaiters: Array<{
+  res: http.ServerResponse;
+  timer: ReturnType<typeof setTimeout>;
+}> = [];
+let pollSeq = 0;
+
+function notifyPollWaiters() {
+  const snapshot = {
+    seq: ++pollSeq,
+    pending: pendingResolve !== null,
+    reason: pendingReason,
+    enabled: feedbackEnabled,
+  };
+  while (pollWaiters.length > 0) {
+    const w = pollWaiters.shift()!;
+    clearTimeout(w.timer);
+    try {
+      w.res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      });
+      w.res.end(JSON.stringify(snapshot));
+    } catch {
+      /* client already gone */
+    }
+  }
+}
+
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+  });
+}
+
+const httpServer = http.createServer(async (req, res) => {
+  const cors: Record<string, string> = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  };
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, cors);
+    res.end();
+    return;
+  }
 
   if (req.url === "/" || req.url === "/index.html") {
     const filePath = path.join(CLIENT_DIR, "index.html");
@@ -100,6 +146,101 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  if (req.url === "/api/status") {
+    res.writeHead(200, { "Content-Type": "application/json", ...cors });
+    res.end(
+      JSON.stringify({
+        seq: pollSeq,
+        pending: pendingResolve !== null,
+        reason: pendingReason,
+        enabled: feedbackEnabled,
+      })
+    );
+    return;
+  }
+
+  if (req.url?.startsWith("/api/poll")) {
+    const url = new URL(req.url, `http://localhost:${WS_PORT}`);
+    const lastSeq = parseInt(url.searchParams.get("seq") || "0", 10);
+
+    if (lastSeq < pollSeq) {
+      res.writeHead(200, { "Content-Type": "application/json", ...cors });
+      res.end(
+        JSON.stringify({
+          seq: pollSeq,
+          pending: pendingResolve !== null,
+          reason: pendingReason,
+          enabled: feedbackEnabled,
+        })
+      );
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      const idx = pollWaiters.findIndex((w) => w.res === res);
+      if (idx >= 0) pollWaiters.splice(idx, 1);
+      res.writeHead(200, { "Content-Type": "application/json", ...cors });
+      res.end(
+        JSON.stringify({
+          seq: pollSeq,
+          pending: pendingResolve !== null,
+          reason: pendingReason,
+          enabled: feedbackEnabled,
+        })
+      );
+    }, 25000);
+
+    pollWaiters.push({ res, timer });
+    return;
+  }
+
+  if (req.url === "/api/feedback" && req.method === "POST") {
+    const body = await readBody(req);
+    try {
+      const data = JSON.parse(body);
+      if (data.text && pendingResolve) {
+        addHistoryEntry("human", data.text);
+        const resolve = pendingResolve;
+        pendingResolve = null;
+        pendingReason = null;
+        resolve(data.text);
+        broadcast({
+          type: "resolved",
+          message: "Feedback received. AI is continuing...",
+        });
+        notifyPollWaiters();
+        res.writeHead(200, { "Content-Type": "application/json", ...cors });
+        res.end(JSON.stringify({ ok: true }));
+      } else {
+        res.writeHead(400, { "Content-Type": "application/json", ...cors });
+        res.end(JSON.stringify({ error: "No pending request or empty text" }));
+      }
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json", ...cors });
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+    }
+    return;
+  }
+
+  if (req.url === "/api/toggle" && req.method === "POST") {
+    const body = await readBody(req);
+    try {
+      const data = JSON.parse(body);
+      feedbackEnabled = !!data.enabled;
+      console.error(
+        `[feedback-collector] Feedback mode ${feedbackEnabled ? "ENABLED" : "DISABLED"} via HTTP`
+      );
+      broadcast({ type: "mode", enabled: feedbackEnabled });
+      notifyPollWaiters();
+      res.writeHead(200, { "Content-Type": "application/json", ...cors });
+      res.end(JSON.stringify({ ok: true, enabled: feedbackEnabled }));
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json", ...cors });
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+    }
+    return;
+  }
+
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json", ...cors });
     res.end(
@@ -108,6 +249,7 @@ const httpServer = http.createServer((req, res) => {
         pending: pendingResolve !== null,
         clients: connectedClients.size,
         historyCount: history.length,
+        feedbackEnabled,
       })
     );
     return;
@@ -277,6 +419,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     addHistoryEntry("ai", reason);
     pendingReason = reason;
     broadcast({ type: "question", reason });
+    notifyPollWaiters();
 
     const humanResponse = await new Promise<string>((resolve) => {
       pendingResolve = resolve;
