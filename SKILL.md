@@ -79,12 +79,24 @@ The UI auto-connects via WebSocket. When the AI calls `ask_human_feedback`, the 
 
 ### `ask_human_feedback`
 
-Suspends the AI thread and waits for human input.
+Suspends the AI thread and waits for human input. If feedback mode is disabled, returns immediately without waiting.
 
 **Parameters:**
 - `reason` (string, required): A clear summary of completed work and what you need from the user.
 
-**Returns:** The human's text response as a string.
+**Returns:** The human's text response as a string (or bypass message if disabled).
+
+### `set_feedback_mode`
+
+Enable or disable feedback confirmation mode.
+
+**Parameters:**
+- `enabled` (boolean, required): `true` to enable, `false` to disable.
+
+**When to use:**
+- User says "自由模式" / "free mode" → call with `enabled: false`
+- User says "确认模式" / "feedback mode" → call with `enabled: true`
+- The mode can also be toggled from the browser UI
 
 **Example usage pattern:**
 

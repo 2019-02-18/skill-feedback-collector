@@ -67,6 +67,7 @@ loadHistory();
 
 let pendingResolve: ((value: string) => void) | null = null;
 let pendingReason: string | null = null;
+let feedbackEnabled = true;
 const connectedClients = new Set<WebSocket>();
 
 const httpServer = http.createServer((req, res) => {
@@ -124,6 +125,8 @@ wss.on("connection", (ws) => {
     `[feedback-collector] Client connected. Total: ${connectedClients.size}`
   );
 
+  ws.send(JSON.stringify({ type: "mode", enabled: feedbackEnabled }));
+
   if (pendingResolve && pendingReason) {
     ws.send(
       JSON.stringify({
@@ -146,6 +149,12 @@ wss.on("connection", (ws) => {
           type: "resolved",
           message: "Feedback received. AI is continuing...",
         });
+      } else if (data.type === "toggle") {
+        feedbackEnabled = !!data.enabled;
+        console.error(
+          `[feedback-collector] Feedback mode ${feedbackEnabled ? "ENABLED" : "DISABLED"} via UI`
+        );
+        broadcast({ type: "mode", enabled: feedbackEnabled });
       }
     } catch {
       console.error("[feedback-collector] Invalid message from client");
@@ -187,7 +196,8 @@ mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Suspend the current AI thread and wait for human feedback via a WebSocket-connected UI. " +
         "Use this tool whenever you finish a task, encounter uncertainty, or need user confirmation " +
-        "before proceeding. This prevents the AI from ending the conversation prematurely.",
+        "before proceeding. This prevents the AI from ending the conversation prematurely. " +
+        "If feedback mode is disabled, this tool returns immediately with a bypass message.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -201,37 +211,89 @@ mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["reason"],
       },
     },
+    {
+      name: "set_feedback_mode",
+      description:
+        "Enable or disable the feedback confirmation mode. " +
+        "When disabled, ask_human_feedback will return immediately without waiting. " +
+        "When enabled (default), ask_human_feedback will suspend the thread and wait for human input. " +
+        "Call this when the user says things like '自由模式/free mode' (disable) or '确认模式/feedback mode' (enable).",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          enabled: {
+            type: "boolean",
+            description: "true to enable feedback mode (default), false to disable it.",
+          },
+        },
+        required: ["enabled"],
+      },
+    },
   ],
 }));
 
 mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name !== "ask_human_feedback") {
+  const toolName = request.params.name;
+
+  if (toolName === "set_feedback_mode") {
+    const enabled = Boolean(request.params.arguments?.enabled);
+    feedbackEnabled = enabled;
+    console.error(
+      `[feedback-collector] Feedback mode ${enabled ? "ENABLED" : "DISABLED"} via MCP tool`
+    );
+    broadcast({ type: "mode", enabled: feedbackEnabled });
     return {
       content: [
-        { type: "text", text: `Unknown tool: ${request.params.name}` },
+        {
+          type: "text",
+          text: `Feedback mode is now ${enabled ? "ENABLED — I will wait for your confirmation after each task." : "DISABLED — I will work freely without pausing for confirmation."}`,
+        },
       ],
-      isError: true,
     };
   }
 
-  const reason = String(
-    request.params.arguments?.reason ?? "AI is waiting for your input."
-  );
+  if (toolName === "ask_human_feedback") {
+    const reason = String(
+      request.params.arguments?.reason ?? "AI is waiting for your input."
+    );
 
-  console.error(`[feedback-collector] AI is asking: ${reason}`);
+    if (!feedbackEnabled) {
+      console.error(
+        `[feedback-collector] Feedback mode disabled, bypassing: ${reason}`
+      );
+      addHistoryEntry("ai", `[BYPASSED] ${reason}`);
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Feedback mode is currently disabled. Continue working autonomously. The user will re-enable feedback mode when needed.",
+          },
+        ],
+      };
+    }
 
-  addHistoryEntry("ai", reason);
-  pendingReason = reason;
-  broadcast({ type: "question", reason });
+    console.error(`[feedback-collector] AI is asking: ${reason}`);
 
-  const humanResponse = await new Promise<string>((resolve) => {
-    pendingResolve = resolve;
-  });
+    addHistoryEntry("ai", reason);
+    pendingReason = reason;
+    broadcast({ type: "question", reason });
 
-  console.error(`[feedback-collector] Human responded: ${humanResponse}`);
+    const humanResponse = await new Promise<string>((resolve) => {
+      pendingResolve = resolve;
+    });
+
+    console.error(`[feedback-collector] Human responded: ${humanResponse}`);
+
+    return {
+      content: [{ type: "text", text: humanResponse }],
+    };
+  }
 
   return {
-    content: [{ type: "text", text: humanResponse }],
+    content: [
+      { type: "text", text: `Unknown tool: ${request.params.name}` },
+    ],
+    isError: true,
   };
 });
 

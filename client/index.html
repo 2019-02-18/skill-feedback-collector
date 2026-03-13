@@ -265,6 +265,55 @@
   }
 
   /* Footer */
+  /* Toggle Switch */
+  .toggle-bar{
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    padding:10px 14px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+  }
+  .toggle-label{
+    font-size:12px;
+    font-weight:500;
+    color:var(--text-dim);
+    display:flex;
+    align-items:center;
+    gap:6px;
+  }
+  .toggle-label .mode-text{color:var(--text)}
+  .toggle{
+    position:relative;
+    width:42px;height:22px;
+    cursor:pointer;
+  }
+  .toggle input{display:none}
+  .toggle-track{
+    position:absolute;inset:0;
+    background:var(--surface-2);
+    border:1px solid var(--border);
+    border-radius:11px;
+    transition:background .2s,border-color .2s;
+  }
+  .toggle input:checked + .toggle-track{
+    background:var(--primary);
+    border-color:var(--primary);
+  }
+  .toggle-knob{
+    position:absolute;
+    top:3px;left:3px;
+    width:16px;height:16px;
+    background:#fff;
+    border-radius:50%;
+    transition:transform .2s;
+    pointer-events:none;
+  }
+  .toggle input:checked ~ .toggle-knob{
+    transform:translateX(20px);
+  }
+
   .foot{
     text-align:center;
     font-size:11px;
@@ -296,6 +345,17 @@
     <div class="conn">
       <div class="conn-dot err" id="dot"></div>
       <span id="connLabel">Connecting...</span>
+    </div>
+
+    <div class="toggle-bar">
+      <div class="toggle-label">
+        Feedback Mode: <span class="mode-text" id="modeText">ON</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="modeToggle" checked>
+        <div class="toggle-track"></div>
+        <div class="toggle-knob"></div>
+      </label>
     </div>
 
     <div class="panel" id="panel">
@@ -332,15 +392,17 @@
 
 <script>
 (function(){
-  const dot       = document.getElementById("dot");
-  const connLabel = document.getElementById("connLabel");
-  const panel     = document.getElementById("panel");
-  const stateTag  = document.getElementById("stateTag");
-  const qText     = document.getElementById("qText");
-  const quickBar  = document.getElementById("quickBar");
-  const input     = document.getElementById("input");
-  const sendBtn   = document.getElementById("sendBtn");
-  const log       = document.getElementById("log");
+  const dot        = document.getElementById("dot");
+  const connLabel  = document.getElementById("connLabel");
+  const panel      = document.getElementById("panel");
+  const stateTag   = document.getElementById("stateTag");
+  const qText      = document.getElementById("qText");
+  const quickBar   = document.getElementById("quickBar");
+  const input      = document.getElementById("input");
+  const sendBtn    = document.getElementById("sendBtn");
+  const log        = document.getElementById("log");
+  const modeToggle = document.getElementById("modeToggle");
+  const modeText   = document.getElementById("modeText");
 
   let ws = null;
   let hasHistory = false;
@@ -439,6 +501,19 @@
     send();
   });
 
+  modeToggle.addEventListener("change", function(){
+    const enabled = modeToggle.checked;
+    modeText.textContent = enabled ? "ON" : "OFF";
+    if(ws && ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify({ type: "toggle", enabled: enabled }));
+    }
+  });
+
+  function syncMode(enabled){
+    modeToggle.checked = enabled;
+    modeText.textContent = enabled ? "ON" : "OFF";
+  }
+
   function connect(){
     if(ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     setConn("err", "Connecting...");
@@ -450,6 +525,7 @@
         if(d.type === "question" && d.reason) showQuestion(d.reason);
         else if(d.type === "resolved") clearQuestion();
         else if(d.type === "waiting") setConn("wait", "Pending request — check UI");
+        else if(d.type === "mode") syncMode(!!d.enabled);
       }catch(e){/* ignore */}
     };
     ws.onclose = function(){
