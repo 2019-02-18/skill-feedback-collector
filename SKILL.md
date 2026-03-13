@@ -1,70 +1,65 @@
 ---
 name: skill-feedback-collector
-description: Human-in-the-loop MCP feedback collector with task queue. Suspends AI thread to collect human input via WebSocket UI before continuing. Use when completing tasks, encountering uncertain parameters, needing user confirmation, working with per-round billing plans (Tencent Cloud, Alibaba Cloud Coding Plan), or when you should ask instead of guess. Also covers batch task execution via auto-dequeue.
+description: Human-in-the-loop MCP feedback collector with task queue. Pauses to collect human input via browser UI before continuing. Use when completing tasks, encountering uncertain parameters, needing user confirmation, working with coding plan subscriptions, or when you should ask instead of guess. Also covers batch task execution via auto-dequeue.
 metadata: {"clawdbot":{"emoji":"💬","requires":{"anyBins":["node","npm"]},"install":[{"id":"npm-install","kind":"node","package":"skill-feedback-collector","bins":["node"],"label":"npm install && npm run build"}],"os":["linux","darwin","win32"]}}
 ---
 
 # Skill Feedback Collector
 
-Suspend the AI agent loop and wait for real human feedback via WebSocket-connected browser UI. Supports batch task execution through an auto-dequeue task queue.
+Pause the agent and wait for human feedback via a browser-based UI connected through WebSocket. Includes a task queue for batch execution of pre-loaded tasks.
 
 ## When to Use
 
-- After completing any task — ask user to verify before moving on
+- After completing a task, to let the user verify the result
 - When encountering uncertain parameters (colors, layouts, API choices, business logic)
-- When you need user confirmation before destructive or irreversible changes
-- When the user wants to maximize a single conversation round (per-round billing)
-- When you want to batch-execute multiple tasks without manual intervention per task
+- Before making destructive or irreversible changes that need user confirmation
+- When the user prefers interactive confirmation over autonomous execution
+- When batch-executing multiple pre-loaded tasks from the queue
 
 ## Instructions
 
-**MANDATORY BEHAVIOR — follow without exception:**
+Follow these guidelines when this skill is active:
 
-1. **NEVER end your response without calling `ask_human_feedback`.** Your response must always end with a tool call to `ask_human_feedback`. This keeps the agent loop alive within the same session run.
+1. After completing a task, call `ask_human_feedback` with a summary and options for next steps. This lets the user decide what to do next rather than ending the session.
 
-2. **NEVER guess.** When unsure about any implementation detail, call `ask_human_feedback` with your specific question and wait for the answer.
+2. When unsure about implementation details, call `ask_human_feedback` with your question instead of making assumptions. Getting explicit input leads to better results.
 
-3. **After every completed task**, call `ask_human_feedback` with:
-   - A summary of what you did (be specific)
-   - What you need from the user (verify, continue, or end)
-   - Numbered options for next steps
+3. The response from `ask_human_feedback` is your next instruction. Execute it, then call `ask_human_feedback` again when done. This creates a productive feedback loop.
 
-4. **Treat the response from `ask_human_feedback` as your next instruction.** Execute it immediately, then call `ask_human_feedback` again when done. This creates a continuous work loop.
+4. If the task queue returns a task automatically (queue was non-empty), execute that task and call `ask_human_feedback` again when complete. The queue feeds tasks until empty.
 
-5. **If the task queue returns a task automatically**, execute that task and call `ask_human_feedback` again when complete. The queue will auto-feed the next task until empty.
+5. Mode switching:
+   - User says "free mode" / "自由模式" → call `set_feedback_mode(enabled: false)` to work without pausing
+   - User says "feedback mode" / "确认模式" → call `set_feedback_mode(enabled: true)` to resume the confirmation loop
 
-6. **Mode control:**
-   - User says "自由模式" / "free mode" → call `set_feedback_mode(enabled: false)` → work autonomously
-   - User says "确认模式" / "feedback mode" → call `set_feedback_mode(enabled: true)` → resume confirmation loop
+## Best Practices
 
-## Safety Rules
-
-- Never end a session or conversation on your own — always ask the user first
-- Never commit destructive changes (force push, drop table, delete files) without explicit user confirmation via `ask_human_feedback`
-- If `ask_human_feedback` returns a bypass message (feedback mode disabled), continue working without pausing
+- Ask the user before ending a session — they may have more tasks
+- Confirm before making destructive changes (force push, drop table, delete files)
+- If feedback mode is disabled (bypass message returned), continue working autonomously
 
 ## Tools
 
 ### `ask_human_feedback`
 
-Suspends the agent loop. Broadcasts `reason` to browser UI via WebSocket. Returns human's text response. If task queue is non-empty, auto-dequeues the next task and returns it immediately (1.5s delay for UI visibility).
+Pauses execution and sends the `reason` to the browser UI. Returns the human's text response. If the task queue is non-empty, the next task is auto-dequeued and returned (with a short delay for UI visibility).
 
-**Parameters:** `reason` (string) — summary of work done + what you need from the user.
+**Parameters:** `reason` (string) — summary of work done and what input you need.
 
 **Example reason format:**
 ```
-✅ Completed: [specific work done]
-📋 Changes: [files modified, endpoints added, etc.]
+Completed: [specific work done]
+Changes: [files modified, endpoints added, etc.]
 
 What would you like me to do next?
 1. [Option A]
 2. [Option B]
-3. Something else — please describe
+3. Something else
 ```
 
 ### `set_feedback_mode`
 
-Toggle feedback confirmation on/off. When off, `ask_human_feedback` returns immediately without suspending.
+Toggle feedback confirmation on/off. When off, `ask_human_feedback` returns immediately without pausing.
 
 **Parameters:** `enabled` (boolean)
 
@@ -87,29 +82,28 @@ Browser UI: `http://<server-ip>:18061`
 
 | Env Variable | Default | Description |
 |---|---|---|
-| `FEEDBACK_PORT` | `18061` | HTTP + WebSocket port |
-| `FEEDBACK_TOKEN` | (empty) | Optional auth token |
+| `FEEDBACK_PORT` | `18061` | HTTP and WebSocket port |
+| `FEEDBACK_TOKEN` | (empty) | Optional access token for the UI |
 
-## Agent Loop Flow
+## Workflow
 
 ```
 User message → Agent works → calls ask_human_feedback("Done. Next?")
                                     ↓
-                    [Queue has tasks?] → YES → auto-return next task → Agent continues
+                    [Queue has tasks?] → YES → returns next task → Agent continues
                                     ↓ NO
-                    [Wait for human input via browser UI]
+                    [Waits for human input via browser UI]
                                     ↓
                     Human responds → Agent receives → works → calls ask_human_feedback again
                                     ↓
-                    ... loop continues until user says "done" or "end" ...
+                    ... loop continues until user indicates they are done ...
 ```
 
 ## Tips
 
-- The task queue lets users pre-load multiple tasks; AI executes them sequentially without pausing
-- Users can add tasks to the queue while AI is working — they'll be picked up automatically
-- WebSocket server binds to `0.0.0.0` — ensure firewall allows the port
+- The task queue lets users pre-load multiple tasks for sequential execution
+- Users can add tasks to the queue while the agent is working
+- WebSocket server binds to all interfaces — ensure firewall allows the port
 - HTTP long-polling fallback activates automatically when WebSocket is unavailable
-- Browser notifications + sound alert when AI asks a question
-- History is persisted to `feedback-history.json` (max 500 entries)
-- Use `FEEDBACK_TOKEN` to protect the UI when deployed on public servers
+- Browser notifications and sound alerts notify you when the agent has a question
+- Conversation history is persisted locally (max 500 entries)
