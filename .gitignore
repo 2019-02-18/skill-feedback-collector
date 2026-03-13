@@ -4,6 +4,7 @@ build/
 *.d.ts.map
 
 feedback-history*.json
+task-queue.json
 
 *.log
 .env

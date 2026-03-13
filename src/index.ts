@@ -18,6 +18,7 @@ const BASE_DIR = path.resolve(
 );
 const CLIENT_DIR = path.join(BASE_DIR, "client");
 const HISTORY_FILE = path.join(BASE_DIR, "feedback-history.json");
+const QUEUE_FILE = path.join(BASE_DIR, "task-queue.json");
 const HEARTBEAT_INTERVAL = 30_000;
 const HEARTBEAT_TIMEOUT = 35_000;
 
@@ -77,6 +78,38 @@ const taskQueue: string[] = [];
 let autoMode = false;
 const AUTO_DELAY_MS = 1500;
 
+function loadQueue() {
+  try {
+    if (fs.existsSync(QUEUE_FILE)) {
+      const raw = fs.readFileSync(QUEUE_FILE, "utf-8");
+      const data = JSON.parse(raw);
+      if (Array.isArray(data.tasks)) {
+        taskQueue.length = 0;
+        taskQueue.push(...data.tasks);
+      }
+      if (typeof data.autoMode === "boolean") {
+        autoMode = data.autoMode;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function saveQueue() {
+  try {
+    fs.writeFileSync(
+      QUEUE_FILE,
+      JSON.stringify({ tasks: [...taskQueue], autoMode }, null, 2),
+      "utf-8"
+    );
+  } catch (err) {
+    console.error("[feedback-collector] Failed to save queue:", err);
+  }
+}
+
+loadQueue();
+
 interface TrackedSocket extends WebSocket {
   isAlive: boolean;
 }
@@ -84,6 +117,7 @@ interface TrackedSocket extends WebSocket {
 const connectedClients = new Set<TrackedSocket>();
 
 function broadcastQueueState() {
+  saveQueue();
   broadcast({ type: "queue", tasks: [...taskQueue], autoMode });
 }
 
@@ -340,6 +374,22 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.url === "/internal/shutdown" && req.method === "POST") {
+    console.error("[feedback-collector] Received shutdown signal from new instance, exiting...");
+    saveQueue();
+    saveHistory();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    setTimeout(() => {
+      for (const client of connectedClients) {
+        client.close(1001, "Server restarting");
+      }
+      httpServer.close();
+      process.exit(0);
+    }, 500);
+    return;
+  }
+
   res.writeHead(404, { "Content-Type": "text/plain", ...cors });
   res.end("Not Found");
 });
@@ -454,14 +504,55 @@ function broadcast(payload: Record<string, unknown>) {
   }
 }
 
-httpServer.listen(WS_PORT, "0.0.0.0", () => {
-  console.error(
-    `[feedback-collector] UI & WebSocket server listening on http://0.0.0.0:${WS_PORT}`
-  );
-  if (AUTH_TOKEN) {
-    console.error(`[feedback-collector] Auth enabled. Use ?token=${AUTH_TOKEN} or Authorization header.`);
-  }
-});
+async function tryShutdownOldProcess(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = http.request(
+      { hostname: "127.0.0.1", port: WS_PORT, path: "/internal/shutdown", method: "POST", timeout: 2000 },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      }
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+function startHttpServer(retries = 3): void {
+  httpServer.listen(WS_PORT, "0.0.0.0", () => {
+    console.error(
+      `[feedback-collector] UI & WebSocket server listening on http://0.0.0.0:${WS_PORT}`
+    );
+    if (AUTH_TOKEN) {
+      console.error(`[feedback-collector] Auth enabled. Use ?token=${AUTH_TOKEN} or Authorization header.`);
+    }
+  });
+
+  httpServer.on("error", async (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE" && retries > 0) {
+      console.error(`[feedback-collector] Port ${WS_PORT} in use, attempting to take over...`);
+      const shutdownOk = await tryShutdownOldProcess();
+      if (shutdownOk) {
+        console.error("[feedback-collector] Old process shutting down, retrying in 1.5s...");
+      } else {
+        console.error("[feedback-collector] Could not contact old process, retrying in 1.5s...");
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+      httpServer.close();
+      startHttpServer(retries - 1);
+    } else if (err.code === "EADDRINUSE") {
+      console.error(
+        `[feedback-collector] Port ${WS_PORT} still in use after retries. ` +
+        `MCP server will work, but browser UI is unavailable. Kill the old process manually.`
+      );
+    } else {
+      console.error("[feedback-collector] HTTP server error:", err);
+    }
+  });
+}
+
+startHttpServer();
 
 const mcpServer = new Server(
   { name: "skill-feedback-collector", version: "1.0.0" },
