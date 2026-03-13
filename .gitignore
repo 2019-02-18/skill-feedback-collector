@@ -7,3 +7,4 @@ feedback-history*.json
 
 *.log
 .env
+role.md
