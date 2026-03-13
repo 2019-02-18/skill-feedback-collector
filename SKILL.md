@@ -65,6 +65,7 @@ npm run build
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FEEDBACK_PORT` | `18061` | Port for WebSocket + HTTP UI server |
+| `FEEDBACK_TOKEN` | (empty) | Optional auth token for API/WebSocket access |
 
 ### Accessing the UI
 

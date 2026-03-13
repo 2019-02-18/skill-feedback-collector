@@ -60,23 +60,32 @@ http://你的服务器IP:18061
 |------|------|
 | MCP 线程挂起 | 通过 Promise 挂起 AI 线程，等待期间零 Token 消耗 |
 | WebSocket 实时通信 | 问题推送与反馈回传全部通过 WebSocket 实时完成 |
+| HTTP 轮询降级 | WebSocket 不可用时自动降级为 HTTP Long-Polling |
 | 反馈模式开关 | 支持通过 UI 或 MCP 工具随时开关反馈确认模式 |
+| WebSocket 心跳 | 30 秒 ping/pong 保活，自动检测和清理死连接 |
+| 浏览器通知 | AI 提问时弹出桌面通知 + 音效提醒，无需盯着页面 |
+| Token 认证 | 可选的 `FEEDBACK_TOKEN` 环境变量保护 API 访问 |
+| Markdown 渲染 | AI 消息支持 `**加粗**` 和 `` `代码` `` 格式化 |
 | 对话历史持久化 | 自动保存到 `feedback-history.json`，最多 500 条 |
+| 历史导出 | 一键导出完整对话记录为 JSON 文件 |
 | 快捷回复 | 内置"继续"、"好的"、"重做"、"结束"快捷按钮 |
-| 自动重连 | 断线后 3 秒自动重连，不会丢失待处理的问题 |
+| 自动重连 | 断线后自动重连，不会丢失待处理的问题 |
 | 服务器部署 | 绑定 `0.0.0.0`，支持外网浏览器访问 |
-| 历史记录 API | `/api/history` 返回最近 100 条对话记录 |
-| 健康检查 | `/health` 返回服务状态、连接数、待处理请求 |
 
 ## 环境变量
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `FEEDBACK_PORT` | `18061` | HTTP + WebSocket 服务端口 |
+| `FEEDBACK_TOKEN` | （空） | 可选的认证 Token，设置后所有 API 和 WebSocket 连接需要携带 Token |
 
 ```bash
 # 自定义端口
 FEEDBACK_PORT=9090 node build/index.js
+
+# 启用认证
+FEEDBACK_TOKEN=my-secret-token node build/index.js
+# 访问时需要：http://服务器IP:18061/?token=my-secret-token
 ```
 
 ## 项目结构

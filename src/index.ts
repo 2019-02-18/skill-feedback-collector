@@ -8,14 +8,18 @@ import { WebSocketServer, WebSocket } from "ws";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { URL } from "node:url";
 
 const WS_PORT = parseInt(process.env.FEEDBACK_PORT || "18061", 10);
+const AUTH_TOKEN = process.env.FEEDBACK_TOKEN || "";
 const BASE_DIR = path.resolve(
   path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1")),
   ".."
 );
 const CLIENT_DIR = path.join(BASE_DIR, "client");
 const HISTORY_FILE = path.join(BASE_DIR, "feedback-history.json");
+const HEARTBEAT_INTERVAL = 30_000;
+const HEARTBEAT_TIMEOUT = 35_000;
 
 interface HistoryEntry {
   id: number;
@@ -68,7 +72,22 @@ loadHistory();
 let pendingResolve: ((value: string) => void) | null = null;
 let pendingReason: string | null = null;
 let feedbackEnabled = true;
-const connectedClients = new Set<WebSocket>();
+
+interface TrackedSocket extends WebSocket {
+  isAlive: boolean;
+}
+
+const connectedClients = new Set<TrackedSocket>();
+
+function checkAuth(req: http.IncomingMessage): boolean {
+  if (!AUTH_TOKEN) return true;
+  const url = new URL(req.url || "/", `http://localhost:${WS_PORT}`);
+  const tokenParam = url.searchParams.get("token");
+  if (tokenParam === AUTH_TOKEN) return true;
+  const authHeader = req.headers.authorization;
+  if (authHeader === `Bearer ${AUTH_TOKEN}`) return true;
+  return false;
+}
 
 const pollWaiters: Array<{
   res: http.ServerResponse;
@@ -93,7 +112,7 @@ function notifyPollWaiters() {
       });
       w.res.end(JSON.stringify(snapshot));
     } catch {
-      /* client already gone */
+      /* client gone */
     }
   }
 }
@@ -110,7 +129,7 @@ const httpServer = http.createServer(async (req, res) => {
   const cors: Record<string, string> = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
 
   if (req.method === "OPTIONS") {
@@ -119,7 +138,7 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url === "/" || req.url === "/index.html") {
+  if (req.url === "/" || req.url?.startsWith("/index.html") || req.url?.startsWith("/?")) {
     const filePath = path.join(CLIENT_DIR, "index.html");
     fs.readFile(filePath, "utf-8", (err, data) => {
       if (err) {
@@ -136,6 +155,14 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.url?.startsWith("/api/")) {
+    if (!checkAuth(req)) {
+      res.writeHead(401, { "Content-Type": "application/json", ...cors });
+      res.end(JSON.stringify({ error: "Unauthorized. Provide ?token=xxx or Authorization: Bearer xxx" }));
+      return;
+    }
+  }
+
   if (req.url === "/api/history") {
     const recent = history.slice(-100).reverse();
     res.writeHead(200, {
@@ -143,6 +170,16 @@ const httpServer = http.createServer(async (req, res) => {
       ...cors,
     });
     res.end(JSON.stringify(recent));
+    return;
+  }
+
+  if (req.url === "/api/history/export") {
+    res.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Disposition": `attachment; filename="feedback-history-${new Date().toISOString().slice(0, 10)}.json"`,
+      ...cors,
+    });
+    res.end(JSON.stringify(history, null, 2));
     return;
   }
 
@@ -261,11 +298,37 @@ const httpServer = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer });
 
-wss.on("connection", (ws) => {
+// --- WebSocket heartbeat ---
+const heartbeatInterval = setInterval(() => {
+  for (const ws of connectedClients) {
+    if (!ws.isAlive) {
+      ws.terminate();
+      connectedClients.delete(ws);
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, HEARTBEAT_INTERVAL);
+
+wss.on("close", () => clearInterval(heartbeatInterval));
+
+wss.on("connection", (rawWs, req) => {
+  if (AUTH_TOKEN && !checkAuth(req)) {
+    rawWs.close(4001, "Unauthorized");
+    return;
+  }
+
+  const ws = rawWs as TrackedSocket;
+  ws.isAlive = true;
   connectedClients.add(ws);
   console.error(
     `[feedback-collector] Client connected. Total: ${connectedClients.size}`
   );
+
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
 
   ws.send(JSON.stringify({ type: "mode", enabled: feedbackEnabled }));
 
@@ -279,6 +342,7 @@ wss.on("connection", (ws) => {
   }
 
   ws.on("message", (raw) => {
+    ws.isAlive = true;
     try {
       const data = JSON.parse(raw.toString());
       if (data.type === "feedback" && data.text && pendingResolve) {
@@ -291,12 +355,14 @@ wss.on("connection", (ws) => {
           type: "resolved",
           message: "Feedback received. AI is continuing...",
         });
+        notifyPollWaiters();
       } else if (data.type === "toggle") {
         feedbackEnabled = !!data.enabled;
         console.error(
           `[feedback-collector] Feedback mode ${feedbackEnabled ? "ENABLED" : "DISABLED"} via UI`
         );
         broadcast({ type: "mode", enabled: feedbackEnabled });
+        notifyPollWaiters();
       }
     } catch {
       console.error("[feedback-collector] Invalid message from client");
@@ -324,6 +390,9 @@ httpServer.listen(WS_PORT, "0.0.0.0", () => {
   console.error(
     `[feedback-collector] UI & WebSocket server listening on http://0.0.0.0:${WS_PORT}`
   );
+  if (AUTH_TOKEN) {
+    console.error(`[feedback-collector] Auth enabled. Use ?token=${AUTH_TOKEN} or Authorization header.`);
+  }
 });
 
 const mcpServer = new Server(
@@ -384,6 +453,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       `[feedback-collector] Feedback mode ${enabled ? "ENABLED" : "DISABLED"} via MCP tool`
     );
     broadcast({ type: "mode", enabled: feedbackEnabled });
+    notifyPollWaiters();
     return {
       content: [
         {
