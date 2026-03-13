@@ -1,7 +1,7 @@
 ---
 name: skill-feedback-collector
 description: Human-in-the-loop MCP feedback collector with task queue. Pauses to collect human input via browser UI before continuing. Use when completing tasks, encountering uncertain parameters, needing user confirmation, working with coding plan subscriptions, or when you should ask instead of guess. Also covers batch task execution via auto-dequeue.
-metadata: {"clawdbot":{"emoji":"💬","requires":{"anyBins":["node","npm"]},"install":[{"id":"npm-install","kind":"node","package":"skill-feedback-collector","bins":["node"],"label":"npm install && npm run build"}],"os":["linux","darwin","win32"]}}
+metadata: {"clawdbot":{"emoji":"💬","requires":{"anyBins":["node","npm"]},"install":[{"id":"npm-install","kind":"node","package":"skill-feedback-collector","label":"npm install && npm run build"}],"os":["linux","darwin","win32"]}}
 ---
 
 # Skill Feedback Collector
@@ -99,11 +99,18 @@ User message → Agent works → calls ask_human_feedback("Done. Next?")
                     ... loop continues until user indicates they are done ...
 ```
 
+## Security
+
+- Set `FEEDBACK_TOKEN` when deploying on shared or public networks to restrict access
+- Use a firewall to limit which IPs can reach the HTTP/WebSocket port
+- The server binds to `0.0.0.0` by default for convenience; restrict network access at the OS or firewall level if needed
+- Conversation history (`feedback-history.json`) is stored locally in the skill directory; review and rotate if it contains sensitive information
+- This skill does not make outbound network requests, download external resources, or execute shell commands
+
 ## Tips
 
 - The task queue lets users pre-load multiple tasks for sequential execution
 - Users can add tasks to the queue while the agent is working
-- WebSocket server binds to all interfaces — ensure firewall allows the port
 - HTTP long-polling fallback activates automatically when WebSocket is unavailable
 - Browser notifications and sound alerts notify you when the agent has a question
 - Conversation history is persisted locally (max 500 entries)
